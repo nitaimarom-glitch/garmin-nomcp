@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -38,7 +39,8 @@ import threading
 import time
 import typing
 
-__all__ = ["G", "connect", "reset", "tools", "call", "raw", "api", "TOKEN_DIR"]
+__all__ = ["G", "connect", "reset", "tools", "call", "raw", "api", "TOKEN_DIR",
+           "force_utf8_stdio"]
 
 # Same location the MCP uses, so tokens already stored by `garmin-mcp-auth`
 # are reused as-is. ~6-month OAuth tokens; the client refreshes them itself.
@@ -185,6 +187,43 @@ class _Collector:
         return lambda fn: fn
 
 
+class _FastMCPUnavailable:
+    """Only reachable if upstream starts really using FastMCP outside __init__."""
+
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "garmin_mcp tried to construct a real FastMCP server, but the `mcp` "
+            "package is not installed. Install it (pip install mcp) or report this "
+            "-- this script is meant to never need it."
+        )
+
+
+def _stub_mcp_if_absent() -> None:
+    """Make `mcp` an optional dependency.
+
+    `garmin_mcp/__init__.py` does `from mcp.server.fastmcp import FastMCP` at
+    module level, but nothing reachable from here ever touches it -- the tool
+    modules carry no MCP dependency. Installing `mcp` just to satisfy that one
+    line drags in pydantic, starlette, uvicorn, anyio and friends: ~30 MB on a
+    pip-installed host, for an import we never use. So when the real package is
+    absent, satisfy the import with a stub instead of requiring it.
+
+    When `mcp` IS installed (a machine that also runs the real server) this does
+    nothing and the genuine import happens, so behaviour never diverges.
+    """
+    import types
+
+    if importlib.util.find_spec("mcp") is not None:
+        return
+
+    mcp = sys.modules.setdefault("mcp", types.ModuleType("mcp"))
+    server = sys.modules.setdefault("mcp.server", types.ModuleType("mcp.server"))
+    fastmcp = sys.modules.setdefault("mcp.server.fastmcp", types.ModuleType("mcp.server.fastmcp"))
+    fastmcp.FastMCP = _FastMCPUnavailable
+    server.fastmcp = fastmcp
+    mcp.server = server
+
+
 def tools(interactive: bool = False) -> dict:
     """Every tool the MCP would expose, as {name: async fn}, bound to a client.
 
@@ -196,6 +235,7 @@ def tools(interactive: bool = False) -> dict:
         return _tools
 
     client = connect(interactive)
+    _stub_mcp_if_absent()
     import garmin_mcp
 
     app = _Collector()
@@ -311,6 +351,18 @@ G = _Facade()
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+def force_utf8_stdio() -> None:
+    """Windows consoles still default to a legacy code page (cp1252 here), and
+    writing Hebrew or a `·` to one raises UnicodeEncodeError. POSIX terminals
+    are already UTF-8, so this is a no-op there. Called from the CLI entry
+    points; importers can call it too."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if (stream.encoding or "").lower().replace("-", "") != "utf8":
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # a pipe or a stream that cannot be reconfigured
+
 def _signature(fn) -> str:
     parts = []
     for p in inspect.signature(fn).parameters.values():
@@ -407,7 +459,8 @@ def _unwrap(value):
 
 def _cmd_batch(source: str, pretty: bool):
     """One login, N calls. `[{"tool": "...", "args": [...], "kwargs": {...}}]`"""
-    text = sys.stdin.read() if source == "-" else open(source).read()
+    text = (sys.stdin.read() if source == "-"
+            else open(source, encoding="utf-8").read())
     results = []
     for item in json.loads(text):
         name = item["tool"]
@@ -472,6 +525,7 @@ def _cmd_repl():
 
 
 def main(argv: list[str]) -> int:
+    force_utf8_stdio()
     if not argv or argv[0] in ("-h", "--help", "help") and len(argv) == 1:
         print(__doc__)
         return 0

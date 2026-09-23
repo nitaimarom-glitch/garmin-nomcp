@@ -44,13 +44,51 @@ The approach is not Garmin-specific. Most FastMCP servers are shaped this way.
 
 ## Install
 
+**macOS / Linux**
+
 ```sh
 git clone https://github.com/NoamVardi18/garmin-nomcp
 cd garmin-nomcp
-./setup.sh          # uv venv + deps + self-check, ~20s
+./setup.sh                # venv + deps + self-check
+./setup.sh --slim         # ~30 MB smaller, see below
 ```
 
-Needs [uv](https://docs.astral.sh/uv/) and Python 3.12.
+Uses [uv](https://docs.astral.sh/uv/) when it is installed and falls back to stdlib `venv` + `pip` when it is not.
+
+**Windows**
+
+```powershell
+git clone https://github.com/NoamVardi18/garmin-nomcp
+cd garmin-nomcp
+.\setup.ps1               # or: .\setup.ps1 -Slim
+.\garmin.cmd doctor
+```
+
+If PowerShell answers *"running scripts is disabled on this system"*, that is Windows' default execution policy, not a fault in the script. Either allow local scripts once (`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`) or bypass it for this one file:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+Needs `git` on PATH — pip resolves the dependency from GitHub, and Windows does not ship git. `setup.ps1` checks for it and says so up front.
+
+Or skip the script entirely — these three lines are all it does, and they cannot trip an execution policy:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python -m pip install "garmin-mcp @ git+https://github.com/Taxuspt/garmin_mcp" "garminconnect==0.3.2"
+.venv\Scripts\python test_garmin.py
+```
+
+`garmin.cmd` is the launcher — use it wherever this README says `./garmin`. Add the repo folder to your PATH and `garmin doctor` works from anywhere.
+
+Both need Python 3.12+.
+
+### Slim install
+
+`garmin_mcp/__init__.py` imports `FastMCP` at module level, and nothing this script calls ever touches it. When the `mcp` package is missing, `garmin.py` satisfies that one import with a stub rather than requiring it — which drops `mcp`, `pydantic`, `starlette`, `uvicorn` and the rest of the server-side tree. On a pip-installed Linux host that is **97 MB → 63 MB**, with all 148 tools still working.
+
+`--slim` / `-Slim` installs everything and then removes that tree. If `mcp` *is* installed, the real import happens as before, so behaviour never differs between the two.
 
 ## Auth
 
@@ -62,7 +100,9 @@ First time, or when they expire:
 ./garmin login      # email + password + MFA, once
 ```
 
-Credentials are never stored — only the tokens, `chmod 700`.
+Credentials are never stored — only the tokens.
+
+On macOS and Linux the token directory is `chmod 700`. **On Windows it is not actually restricted:** Python's `os.chmod` only toggles the read-only bit there and does not touch NTFS ACLs, so the tokens inherit whatever your user profile grants. They are ~6-month bearer credentials to the whole Garmin account — on a shared Windows machine, lock the folder down yourself (`icacls`) or point `GARMINTOKENS` somewhere you control.
 
 ## Use
 
@@ -102,6 +142,32 @@ One login is cached across every call in the process.
 | `batch` | many calls, one login, one JSON array out |
 
 `raw` matters more than it sounds. The MCP tools deliberately drop fields to protect context — `get_activities_by_date` returns `average_hr: null`. The raw call has heart rate, pace, cadence, ground-contact time, training effect and VO₂max.
+
+## Daily digest
+
+`daily_digest.py` renders one day as a plain-text Hebrew Telegram message — activities with pace, HR and load; steps and intensity minutes; last night's sleep; morning readiness with the factor dragging it down; acute/chronic load.
+
+```sh
+./daily_digest.py                    # today, printed
+./daily_digest.py --date 2026-09-04
+./daily_digest.py --send             # post it to Telegram
+```
+
+Every metric is optional. A rest day, a missing night, or a watch left on the charger shortens the message instead of raising, and a day with nothing recorded exits without sending — so cron stays quiet rather than pinging you with an empty template. Pass `--always` to send regardless.
+
+Telegram goes through the host's own `~/.claude/hooks/tg-notify.js` when that exists, otherwise a direct API call using `GARMIN_DIGEST_BOT_TOKEN` + `GARMIN_DIGEST_CHAT_ID` (env, or `~/.garmin-digest.env`).
+
+### As a cron job
+
+```cron
+0 20 * * * export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; cd ~/garmin-nomcp && ./.venv/bin/python daily_digest.py --send >> ~/logs/garmin-digest.log 2>&1
+```
+
+Cron runs with a bare `PATH`, which is where jobs like this usually die silently. Rehearse it the way cron will actually run it before trusting the schedule:
+
+```sh
+env -i HOME=$HOME /bin/sh -c 'export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"; cd ~/garmin-nomcp && ./.venv/bin/python daily_digest.py'
+```
 
 ## Verify
 

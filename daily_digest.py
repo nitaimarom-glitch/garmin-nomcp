@@ -195,7 +195,7 @@ def _weakest_factor(readiness: dict) -> str | None:
 def _load_env_file(path: str) -> dict:
     cfg = {}
     try:
-        with open(os.path.expanduser(path)) as fh:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
             for line in fh:
                 if "=" in line and not line.lstrip().startswith("#"):
                     k, _, v = line.partition("=")
@@ -235,7 +235,8 @@ def send(text: str) -> None:
         node = shutil.which("node")
         if node:
             result = subprocess.run([node, TG_NOTIFY, text, "--he"],
-                                    capture_output=True, text=True, timeout=60)
+                                    capture_output=True, text=True, timeout=60,
+                                    encoding="utf-8", errors="replace")
             if result.returncode == 0:
                 print("sent → tg-notify", file=sys.stderr)
                 return
@@ -317,6 +318,7 @@ def main() -> int:
                         help="append Claude-generated analysis and suggestions "
                              "(needs the local Claude Code CLI logged in)")
     args = parser.parse_args()
+    garmin.force_utf8_stdio()
 
     message, substantive = render(args.date, collect(args.date))
     print(message)

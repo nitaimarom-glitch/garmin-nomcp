@@ -1,0 +1,8 @@
+# Keep POSIX shell scripts LF even when checked out on Windows: a CRLF `garmin`
+# or `setup.sh` fails with a confusing "bad interpreter" under WSL and Git Bash.
+*.sh text eol=lf
+garmin text eol=lf
+*.py text eol=lf
+# ...and keep the Windows launchers CRLF, which cmd.exe is happiest with.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
