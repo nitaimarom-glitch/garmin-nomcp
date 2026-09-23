@@ -35,15 +35,20 @@ import os
 import pkgutil
 import sys
 import threading
+import time
 import typing
 
-__all__ = ["G", "connect", "tools", "call", "raw", "api", "TOKEN_DIR"]
+__all__ = ["G", "connect", "reset", "tools", "call", "raw", "api", "TOKEN_DIR"]
 
 # Same location the MCP uses, so tokens already stored by `garmin-mcp-auth`
 # are reused as-is. ~6-month OAuth tokens; the client refreshes them itself.
 TOKEN_DIR = os.path.expanduser(os.getenv("GARMINTOKENS") or "~/.garminconnect")
 
 DEFAULT_TIMEOUT = float(os.getenv("GARMIN_CALL_TIMEOUT", "90") or 0)
+# Auth should answer faster than a data pull, and it runs up to
+# GARMIN_LOGIN_RETRIES times - keep the worst case well inside the
+# scheduled task's own 10-minute kill limit.
+LOGIN_TIMEOUT = float(os.getenv("GARMIN_LOGIN_TIMEOUT", "60") or 0)
 
 _client = None
 _tools: dict | None = None
@@ -57,28 +62,78 @@ def connect(interactive: bool = False):
 
     Cached after the first call, so a script that makes twenty calls logs in
     once. `interactive=True` allows a fresh email/password + MFA login.
+
+    A login/refresh call occasionally fails transiently (a network blip, a
+    slow response from Garmin's auth service) rather than because the
+    tokens are actually unusable. Retrying a few times before giving up
+    turns that kind of one-off hiccup into a delay instead of a full sync
+    failure for the day.
+
+    Only network-shaped failures get retried. An authentication error or a
+    429 means Garmin has already rejected this token/IP - hammering that
+    with fast retries doesn't recover it, it deepens the block (confirmed:
+    ~15-20 rapid auth retries during same-day debugging turned one bad
+    login into several hours of hard lockout). Those fail immediately.
     """
     global _client
     if _client is not None:
         return _client
 
-    from garminconnect import Garmin
+    from garminconnect import (
+        Garmin,
+        GarminConnectAuthenticationError,
+        GarminConnectTooManyRequestsError,
+    )
 
     is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
 
-    try:
-        client = Garmin(is_cn=is_cn)
-        client.login(TOKEN_DIR)
-    except Exception as token_err:
-        if not interactive:
-            raise SystemExit(
-                f"No usable Garmin tokens in {TOKEN_DIR} ({type(token_err).__name__}).\n"
-                f"Run:  {sys.argv[0]} login"
-            )
-        client = _interactive_login(is_cn)
+    attempts = int(os.getenv("GARMIN_LOGIN_RETRIES", "3"))
+    delays = [5, 15, 30]
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            client = Garmin(is_cn=is_cn)
+            # Bounded like every other Garmin call. Without this the login /
+            # token-refresh could hang forever: `raw()`/`api()` call connect()
+            # OUTSIDE their own _run_bounded wrapper, so a stalled auth request
+            # had no timeout at all. Unattended that meant the whole sync hung
+            # until Task Scheduler killed it (exit 0xC000013A) - no data, no
+            # push, and no recorded reason.
+            _run_bounded(lambda: client.login(TOKEN_DIR), LOGIN_TIMEOUT)
+            _client = client
+            return _client
+        except (GarminConnectAuthenticationError, GarminConnectTooManyRequestsError) as exc:
+            # Not retryable: retrying just adds more failed attempts against
+            # an already-rejecting endpoint.
+            last_err = exc
+            break
+        except Exception as exc:
+            last_err = exc
+            if attempt < attempts - 1:
+                wait = delays[min(attempt, len(delays) - 1)]
+                print(f"  (login attempt {attempt + 1}/{attempts} failed: "
+                      f"{type(exc).__name__}: {exc} - retrying in {wait}s)",
+                      file=sys.stderr)
+                time.sleep(wait)
 
-    _client = client
-    return client
+    if not interactive:
+        raise SystemExit(
+            f"No usable Garmin tokens in {TOKEN_DIR} "
+            f"({type(last_err).__name__}: {last_err}).\nRun:  {sys.argv[0]} login"
+        )
+    _client = _interactive_login(is_cn)
+    return _client
+
+
+def reset():
+    """Drop the cached client so the next call re-authenticates from scratch.
+
+    Useful for a caller that wants to retry a whole pull after a failure -
+    without this, `_client` would stay in whatever half-broken state the
+    failed attempt left it in, and a retry would just reuse that.
+    """
+    global _client
+    _client = None
 
 
 def _interactive_login(is_cn: bool):
@@ -332,12 +387,21 @@ def _cmd_help(name: str):
 
 def _unwrap(value):
     """Most tools return JSON *as a string*; nesting that inside batch output
-    would double-encode it and defeat jq. Parse it back when it is JSON."""
+    would double-encode it and defeat jq. Parse it back when it is JSON.
+
+    Some list-valued responses (e.g. get_training_readiness) go one level
+    further and JSON-encode each item individually rather than the list as a
+    whole, so a single top-level parse leaves a list of strings instead of a
+    list of dicts. Recurse into list items too so callers always get real
+    objects, not one more layer of string left to parse themselves.
+    """
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            value = json.loads(value)
         except (ValueError, TypeError):
             return value
+    if isinstance(value, list):
+        return [_unwrap(item) for item in value]
     return value
 
 

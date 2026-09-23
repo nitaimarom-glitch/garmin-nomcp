@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import glob
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 
@@ -254,16 +256,76 @@ def send(text: str) -> None:
     print("sent → Telegram", file=sys.stderr)
 
 
+def _find_claude_exe() -> str | None:
+    """Locate the Claude Code CLI bundled with the desktop app.
+
+    The app auto-updates and re-versions its install folder, so this globs
+    for whatever version is currently there instead of pinning one.
+    """
+    override = os.getenv("CLAUDE_EXE")
+    if override and os.path.isfile(override):
+        return override
+    pattern = os.path.expanduser(r"~\AppData\Roaming\Claude\claude-code\*\claude.exe")
+    candidates = glob.glob(pattern)
+    return max(candidates, key=os.path.getmtime) if candidates else None
+
+
+AI_PROMPT = """הנה סיכום יומי של נתוני גרמין שלי (צעדים, אימונים, שינה, מוכנות, עומס אימון). \
+תוסיף בעברית סעיף קצר בשם "ניתוח והצעות לשיפור" (2-4 משפטים): תובנה אחת קונקרטית \
+ו-1-3 המלצות פעולה, כולל המלצת אימון ליום הקרוב (סוג, עצימות, האם יום התאוששות) אם \
+הנתונים תומכים בזה - הכל מבוסס אך ורק על המספרים שבסיכום, בלי להמציא נתונים שלא מופיעים \
+בו. אם היום דל בנתונים, תגיד את זה בקצרה ואל תמציא. תחזיר רק את הסעיף הזה, בלי לחזור על \
+הסיכום המקורי.
+
+--- הסיכום ---
+{digest}
+"""
+
+
+def ai_analysis(digest_text: str) -> str | None:
+    """Ask the local Claude Code CLI for coaching-level suggestions.
+
+    Best-effort: any failure (not installed, not logged in, timeout) just
+    means the digest goes out without this section - never blocks sending.
+    """
+    exe = _find_claude_exe()
+    if not exe:
+        print("  (claude.exe not found; skipping AI analysis)", file=sys.stderr)
+        return None
+    try:
+        result = subprocess.run(
+            [exe, "-p", AI_PROMPT.format(digest=digest_text)],
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+        )
+    except Exception as exc:
+        print(f"  (AI analysis skipped: {type(exc).__name__})", file=sys.stderr)
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"  (AI analysis skipped: exit {result.returncode}: "
+              f"{result.stderr.strip()[:200]})", file=sys.stderr)
+        return None
+    return result.stdout.strip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Daily Garmin digest for Telegram")
     parser.add_argument("--date", default=dt.date.today().isoformat(), help="YYYY-MM-DD")
     parser.add_argument("--send", action="store_true", help="post to Telegram")
     parser.add_argument("--always", action="store_true",
                         help="send even when the day has nothing in it")
+    parser.add_argument("--ai", action="store_true",
+                        help="append Claude-generated analysis and suggestions "
+                             "(needs the local Claude Code CLI logged in)")
     args = parser.parse_args()
 
     message, substantive = render(args.date, collect(args.date))
     print(message)
+
+    if args.ai and substantive:
+        analysis = ai_analysis(message)
+        if analysis:
+            message = message + "\n\n" + analysis
+            print("\n" + analysis)
 
     if args.send:
         if substantive or args.always:
